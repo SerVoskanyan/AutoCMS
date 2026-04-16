@@ -19,6 +19,14 @@ class Setting(Base):
     setting_value = Column(Text, nullable=True) # Usually JSON stored as Text
     description = Column(String, nullable=True)
 
+class PromptTemplate(Base):
+    __tablename__ = "prompt_templates"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class ShedevrumTask(Base):
     __tablename__ = "shedevrum_tasks"
 
