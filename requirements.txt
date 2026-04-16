@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+sqlalchemy
+passlib[bcrypt]
+python-jose[cryptography]
+python-dotenv
+playwright
+gspread
+google-auth
+requests
+pydantic
+pydantic-settings
