@@ -213,9 +213,14 @@ def run_pipeline():
         profile_path = os.path.abspath(CHROME_PROFILE_PATH)
         browser = p.chromium.launch_persistent_context(
             user_data_dir=profile_path,
-            headless=False, # Set to True for server use, but might need auth
-            channel="chrome",
-            args=['--disable-blink-features=AutomationControlled']
+            headless=True,  # МЕНЯЕМ НА TRUE ДЛЯ DOCKER
+            # channel="chrome", # Эту строку лучше закомментировать, так как мы используем chromium
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu'
+            ]
         )
         page = browser.pages[0]
         

@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db.session import engine, get_db, SessionLocal
+from app.models import models
 from app.models.models import Base, User, ShedevrumTask, Setting
 
 # Initialize Database
@@ -56,12 +57,60 @@ class SettingUpdate(BaseModel):
     value: str
     description: Optional[str] = None
 
-class TaskResponse(BaseModel):
+class TaskSchema(BaseModel):
     id: int
-    source_id: Optional[str]
-    prompt: Optional[str]
+    source_id: Optional[str] = None
+    prompt: Optional[str] = None
+    model: Optional[str] = None
+    author: Optional[str] = None
+    likes: Optional[str] = None
+    views: Optional[str] = None
+    url: Optional[str] = None
+    image_url: Optional[str] = None
+    date: Optional[str] = None
+    prompt_ai: Optional[str] = None
+    model_ai: Optional[str] = None
+    author_ai: Optional[str] = None
+    likes_ai: Optional[str] = None
+    views_ai: Optional[str] = None
+    url_ai: Optional[str] = None
+    image_url_ai: Optional[str] = None
+    date_ai: Optional[str] = None
     status: str
-    created_at: datetime
+    aspect_ratio: Optional[str] = None
+    attempt_count: Optional[int] = 0
+    error_log: Optional[str] = None
+    scraping_period: Optional[str] = None
+    api_key_used: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+class TaskUpdate(BaseModel):
+    source_id: Optional[str] = None
+    prompt: Optional[str] = None
+    model: Optional[str] = None
+    author: Optional[str] = None
+    likes: Optional[str] = None
+    views: Optional[str] = None
+    url: Optional[str] = None
+    image_url: Optional[str] = None
+    date: Optional[str] = None
+    prompt_ai: Optional[str] = None
+    model_ai: Optional[str] = None
+    author_ai: Optional[str] = None
+    likes_ai: Optional[str] = None
+    views_ai: Optional[str] = None
+    url_ai: Optional[str] = None
+    image_url_ai: Optional[str] = None
+    date_ai: Optional[str] = None
+    status: Optional[str] = None
+    aspect_ratio: Optional[str] = None
+    attempt_count: Optional[int] = None
+    error_log: Optional[str] = None
+    scraping_period: Optional[str] = None
+    api_key_used: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -116,10 +165,24 @@ async def start_task(background_tasks: BackgroundTasks, current_user: User = Dep
     background_tasks.add_task(run_pipeline_task)
     return {"status": "started", "message": "Pipeline execution started in background"}
 
-@app.get("/api/tasks", response_model=List[TaskResponse])
+@app.get("/api/tasks", response_model=List[TaskSchema])
 async def get_tasks(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    tasks = db.query(ShedevrumTask).order_by(ShedevrumTask.created_at.desc()).all()
+    tasks = db.query(models.ShedevrumTask).order_by(models.ShedevrumTask.created_at.desc()).all()
     return tasks
+
+@app.patch("/api/tasks/{task_id}", response_model=TaskSchema)
+async def update_task(task_id: int, task_update: TaskUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    db_task = db.query(models.ShedevrumTask).filter(models.ShedevrumTask.id == task_id).first()
+    if not db_task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    update_data = task_update.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_task, key, value)
+    
+    db.commit()
+    db.refresh(db_task)
+    return db_task
 
 @app.patch("/api/settings")
 async def update_settings(setting: SettingUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):

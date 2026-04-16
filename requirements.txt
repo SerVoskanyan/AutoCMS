@@ -5,8 +5,10 @@ passlib[bcrypt]
 python-jose[cryptography]
 python-dotenv
 playwright
+bcrypt==4.0.1
 gspread
 google-auth
 requests
 pydantic
 pydantic-settings
+python-multipart
