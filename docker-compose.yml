@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  autocms-api:
+    build: .
+    container_name: autocms-api
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    networks:
+      - autocms-net
+    depends_on:
+      - redis
+
+  appsmith:
+    image: appsmith/appsmith-ce
+    container_name: appsmith
+    restart: always
+    ports:
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      - appsmith-stacks:/appsmith-stacks
+    networks:
+      - autocms-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: autocms-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    networks:
+      - autocms-net
+
+networks:
+  autocms-net:
+    driver: bridge
+
+volumes:
+  appsmith-stacks:

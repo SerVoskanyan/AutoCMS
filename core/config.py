@@ -1,10 +1,11 @@
+import os
 # Settings for Shedevrum Factory Pro v.3.0
 
 # API & Auth
 SERVICE_ACCOUNT_FILE = 'service_account.json'
 SHEET_NAME = 'Shedevrum_Trends'
-CHROME_PROFILE_PATH = './shedevrum_session'
-GEMINI_MODEL = 'models/gemini-2.5-flash'
+CHROME_PROFILE_PATH = os.getenv('CHROME_PROFILE_PATH', './shedevrum_session')
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'models/gemini-2.5-flash')
 
 # Limits & Timeouts
 MAX_TARGET = 20
