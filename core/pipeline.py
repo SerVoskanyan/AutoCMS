@@ -13,7 +13,28 @@ from sqlalchemy.orm import Session
 
 # Import project components
 from app.db.session import SessionLocal
-from app.models.models import ShedevrumTask, Setting
+from app.models.models import ShedevrumTask, Setting, AppConfig, ProcessStatus
+
+def update_process_status(task_name, status, progress, log_msg=None, db: Session = None):
+    should_close = False
+    if db is None:
+        db = SessionLocal()
+        should_close = True
+    try:
+        proc = db.query(ProcessStatus).filter(ProcessStatus.task_name == task_name).first()
+        if not proc:
+            proc = ProcessStatus(task_name=task_name)
+            db.add(proc)
+        proc.status = status
+        proc.progress_percent = progress
+        if log_msg:
+            proc.last_log = log_msg
+        db.commit()
+    except Exception as e:
+        print(f"Error updating process status: {e}")
+    finally:
+        if should_close:
+            db.close()
 
 # Import settings from core.config (which was copied from original)
 try:
@@ -28,12 +49,22 @@ class PipelineLogger:
         if not os.path.exists(os.path.dirname(log_path)):
             os.makedirs(os.path.dirname(log_path))
 
-    def log(self, message, level="INFO"):
+    def log(self, message, level="INFO", db: Session = None, module=None):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         clean_msg = f"[{timestamp}] [{level}] {message}"
         print(clean_msg)
         with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(clean_msg + "\n")
+        
+        if db:
+            from app.models.models import Log
+            try:
+                new_log = Log(message=message, level=level, module=module)
+                db.add(new_log)
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f"Failed to save log to DB: {e}")
 
 logger = PipelineLogger(LOG_FILE)
 
@@ -70,13 +101,31 @@ def clean_output(text):
             text = re.sub(r'^[,.\-!:\s]+', '', text)
     return text.strip()[:480]
 
-def scraper_stage(page, db: Session):
-    logger.log("STAGE: SCRAPING", "STAGE")
+def parse_stat_number(val):
+    if not val: return "0"
+    val_lower = val.lower().replace(',', '.')
+    multiplier = 1
+    if 'к' in val_lower or 'k' in val_lower: multiplier = 1000
+    elif 'м' in val_lower or 'm' in val_lower: multiplier = 1000000
+    digits = re.sub(r'[^\d\.]', '', val_lower)
+    if not digits: return "0"
     try:
-        page.goto('https://shedevrum.ai/top/day/', timeout=60000)
+        num = float(digits) * multiplier
+        return str(int(num))
+    except ValueError:
+        return "0"
+
+def scraper_stage(page, db: Session, target_url: str = None, limit: int = None):
+    update_process_status("Scraper", "Running", 10, "Starting Scraper Stage", db=db)
+    logger.log("STAGE: SCRAPING", "STAGE", db=db, module="Scraper")
+    new_count = 0
+    updated_count = 0
+    url_to_scrape = target_url or 'https://shedevrum.ai/top/day/'
+    try:
+        page.goto(url_to_scrape, timeout=60000)
         page.wait_for_load_state("networkidle")
     except:
-        logger.log("Initial load failed, reloading...", "WARNING")
+        logger.log(f"Initial load failed for {url_to_scrape}, reloading...", "WARNING", db=db, module="Scraper")
         page.reload()
     
     # In a headless environment, we might need to handle login or skip it
@@ -89,16 +138,21 @@ def scraper_stage(page, db: Session):
         new_links = page.evaluate(r"""() => Array.from(document.querySelectorAll("a[href*='/post/']")).map(a => a.href)""")
         links_set.update([l for l in new_links if r"/post/" in l and "#" not in l])
     
-    all_links = list(links_set)[:MAX_TARGET]
+    max_to_scrape = limit or MAX_TARGET
+    all_links = list(links_set)[:max_to_scrape]
+    total_links = len(all_links)
     
-    for url in all_links:
+    for idx, url in enumerate(all_links):
+        # Update progress 20-90% range
+        current_progress = 20 + int((idx / total_links) * 70) if total_links > 0 else 20
         id_match = re.search(r"/post/([^/?#]+)", url)
         if not id_match: continue
         post_id = id_match.group(1)
         
+        update_process_status("Scraper", "Running", current_progress, f"Scraping {post_id} ({idx+1}/{total_links})", db=db)
+        
         # Check DB
         existing = db.query(ShedevrumTask).filter(ShedevrumTask.source_id == post_id).first()
-        if existing: continue
         
         logger.log(f"🔎 Scraping {post_id}...", "INFO")
         try:
@@ -109,6 +163,37 @@ def scraper_stage(page, db: Session):
             if not prompt_el.is_visible(timeout=2000): continue
             prompt_text = prompt_el.inner_text().strip()
             
+            # Extract Author
+            author_text = "Неизвестно"
+            author_el = page.locator("a[href*='/@'], a[href*='/profile/']").first
+            if author_el.is_visible(timeout=2000):
+                author_text = author_el.inner_text().strip()
+            
+            # Extract Image URL
+            image_url = ""
+            img_el = page.locator("article img, main img").first
+            if img_el.is_visible(timeout=2000):
+                image_url = img_el.get_attribute("src") or ""
+
+            # Extract Stats (Likes/Views)
+            stats_list = page.evaluate("""() => {
+                let res = [];
+                let elements = Array.from(document.querySelectorAll('span, button'));
+                for (let el of elements) {
+                    let text = el.innerText.trim();
+                    if (/^[\\d\\.,\\s]+[ккмkkm]?$/i.test(text)) {
+                        res.push(text);
+                    }
+                }
+                return res;
+            }""")
+            
+            likes_cleaned = "0"
+            views_cleaned = "0"
+            valid_stats = [parse_stat_number(s) for s in stats_list if parse_stat_number(s) != "0"]
+            if len(valid_stats) >= 1: likes_cleaned = valid_stats[0]
+            if len(valid_stats) >= 2: views_cleaned = valid_stats[1]
+
             raw_model = ""
             stretch_el = page.locator('span.stretch-tabs').first
             if stretch_el.is_visible(timeout=2000): raw_model = stretch_el.inner_text().strip()
@@ -121,7 +206,7 @@ def scraper_stage(page, db: Session):
             
             # Aspect Ratio
             ratio_str = "1:1"
-            sizes = page.evaluate(r"""() => {
+            sizes = page.evaluate("""() => {
                 const img = document.querySelector('article img, main img');
                 return img ? { w: img.naturalWidth, h: img.naturalHeight } : null;
             }""")
@@ -130,22 +215,44 @@ def scraper_stage(page, db: Session):
                 if w > h: ratio_str = "16:9"
                 elif h > w: ratio_str = "9:16"
             
-            new_task = ShedevrumTask(
-                source_id=post_id,
-                prompt=prompt_text,
-                model=raw_model,
-                status="🆕 New",
-                model_ai=model_final,
-                aspect_ratio=ratio_str,
-                date=f"{datetime.now():%d.%m.%Y %H:%M}"
-            )
-            db.add(new_task)
+            if existing:
+                # Update only stats
+                existing.likes = likes_cleaned
+                existing.views = views_cleaned
+                # We don't change status if it's already processed, 
+                # but we can update other metadata if needed.
+                # Logic: only update numbers.
+                updated_count += 1
+                logger.log(f"♻️ Updated stats for {post_id}")
+            else:
+                new_task = ShedevrumTask(
+                    source_id=post_id,
+                    prompt=prompt_text,
+                    model=raw_model,
+                    author=author_text,
+                    likes=likes_cleaned,
+                    views=views_cleaned,
+                    url=url,
+                    image_url=image_url,
+                    status="🆕 New",
+                    model_ai=model_final,
+                    aspect_ratio=ratio_str,
+                    date=f"{datetime.now():%d.%m.%Y %H:%M}"
+                )
+                db.add(new_task)
+                new_count += 1
+                logger.log(f"✅ Added new task {post_id}")
+            
             db.commit()
             
         except Exception as e:
-            logger.log(f"Scrape error {post_id}: {e}", "ERROR")
+            logger.log(f"Scrape error {post_id}: {e}", "ERROR", db=db, module="Scraper")
+
+    update_process_status("Scraper", "Idle", 100, f"Added {new_count}, Updated {updated_count}", db=db)
+    logger.log(f"📊 SCRAPING REPORT: Added {new_count} new, Updated {updated_count} existing.", "INFO", db=db, module="Scraper")
 
 def generator_stage(db: Session):
+    update_process_status("Generator", "Running", 50, "Starting AI Generation", db=db)
     logger.log("STAGE: GENERATION", "STAGE")
     if not os.path.exists(SERVICE_ACCOUNT_FILE):
         logger.log(f"Missing service account file: {SERVICE_ACCOUNT_FILE}", "ERROR")
@@ -204,9 +311,9 @@ def poster_stage(page, db: Session):
             task.status = "⏳ Pending_Later"
             db.commit()
 
-def run_pipeline():
-    logger.log("🚦 Starting AutoCMS Pipeline 🚦", "STAGE")
+def run_pipeline(target_url: str = None, limit: int = None):
     db = SessionLocal()
+    logger.log("🚦 Starting AutoCMS Pipeline 🚦", "STAGE", db=db, module="Pipeline")
     
     with sync_playwright() as p:
         # Using chrome profile from config
@@ -225,13 +332,17 @@ def run_pipeline():
         page = browser.pages[0]
         
         try:
-            scraper_stage(page, db)
+            scraper_stage(page, db, target_url=target_url, limit=limit)
             generator_stage(db)
             poster_stage(page, db)
         finally:
             browser.close()
             db.close()
-    logger.log("🏁 Pipeline Finished", "STAGE")
+    
+    # We need a new session for the final log since we closed the old one
+    final_db = SessionLocal()
+    logger.log("🏁 Pipeline Finished", "STAGE", db=final_db, module="Pipeline")
+    final_db.close()
 
 if __name__ == "__main__":
     run_pipeline()

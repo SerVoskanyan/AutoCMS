@@ -4,6 +4,33 @@ import random
 import re
 import gspread
 from datetime import datetime
+import os
+import sys
+
+# Ensure project root is in path for app imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.db.session import SessionLocal
+from app.models.models import Log, AppConfig, ProcessStatus
+
+def log_to_db(message, level="INFO"):
+    db = SessionLocal()
+    try:
+        new_log = Log(message=message, level=level, module="Scraper")
+        db.add(new_log)
+        
+        # Update process status
+        proc = db.query(ProcessStatus).filter(ProcessStatus.task_name == "Scraper").first()
+        if not proc:
+            proc = ProcessStatus(task_name="Scraper")
+            db.add(proc)
+        proc.status = "Running" if level == "INFO" else "Error"
+        proc.last_log = message
+        
+        db.commit()
+    except Exception as e:
+        print(f"Error logging to DB: {e}")
+    finally:
+        db.close()
 
 # ЛИМИТ СБОРА: сколько новых/обновляемых постов обрабатывать за раз
 MAX_POSTS = 5
@@ -84,8 +111,27 @@ def simulate_human_behavior(page):
     except Exception as e:
         print(f"⚠️ Ошибка при имитации поведения: {e}")
 
-def run():
+def run(target_url=None, limit=None):
+    import json
     posts_data = []
+    
+    # Load from AppConfig if not provided
+    if target_url is None or limit is None:
+        try:
+            db = SessionLocal()
+            configs = db.query(AppConfig).all()
+            conf_dict = {c.key: c.value for c in configs}
+            db.close()
+            
+            if target_url is None: target_url = conf_dict.get("url")
+            if limit is None: 
+                limit_raw = conf_dict.get("limit")
+                if limit_raw: limit = int(limit_raw)
+        except Exception as e:
+            print(f"Error reading AppConfig in scraper: {e}")
+
+    final_url = target_url or 'https://shedevrum.ai/top/day/'
+    final_limit = limit or MAX_POSTS
     
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -106,12 +152,13 @@ def run():
         )
         page = context.new_page()
         
-        print("Переходим на https://shedevrum.ai/top/day/ ...")
+        log_to_db("🚀 Starting Scraper execution...")
+        print(f"Переходим на {final_url} ...")
         
         # Retry-логика на случай проблем с DNS/сетью
         for attempt in range(3):
             try:
-                page.goto('https://shedevrum.ai/top/day/', timeout=60000)
+                page.goto(final_url, timeout=60000)
                 break
             except Exception as nav_err:
                 print(f"Попытка {attempt+1}/3 не удалась: {nav_err}")
@@ -141,7 +188,19 @@ def run():
         no_new_posts_count = 0
         
         for i in range(10):
-            print(f"Скролл {i+1}/10...")
+            progress = 10 + (i * 5) # 10-60% during scrolling
+            msg = f"Scroll {i+1}/10..."
+            log_to_db(msg)
+            
+            # Manually update progress since log_to_db doesn't handle percentage
+            db = SessionLocal()
+            proc = db.query(ProcessStatus).filter(ProcessStatus.task_name == "Scraper").first()
+            if proc:
+                proc.progress_percent = progress
+                db.commit()
+            db.close()
+
+            print(msg)
             page.mouse.wheel(0, 1000)
             time.sleep(2)
             
@@ -282,9 +341,9 @@ def run():
                         prompt = aria_text
                         
                 if prompt and is_valid_prompt(prompt, author):
-                    # Проверяем, не набрали ли мы уже лимит MAX_POSTS
-                    if len(posts_data) >= MAX_POSTS:
-                        print(f"🛑 Достигнут лимит MAX_POSTS ({MAX_POSTS}).")
+                    # Проверяем, не набрали ли мы уже лимит final_limit
+                    if len(posts_data) >= final_limit:
+                        print(f"🛑 Достигнут лимит final_limit ({final_limit}).")
                         break
                         
                     is_new = post_id not in existing_ids and post_id not in seen_ids
@@ -295,11 +354,22 @@ def run():
                         
                     seen_ids.add(post_id)
                     
-                    # ПЕРЕХОД НА СТРАНИЦУ ПОСТА
-                    aspect_ratio = "Не удалось найти"
-                    actual_model = info.get("model", "")
+                    # Update progress 60-95%
+                    current_idx = len(posts_data)
+                    scrape_progress = 60 + int((current_idx / final_limit) * 35) if final_limit > 0 else 60
                     
-                    print(f"🔎 Перехожу на страницу {post_id} {'(Новый)' if is_new else '(Обновление)'}...")
+                    msg = f"🔎 Scraping {post_id} ({current_idx+1}/{final_limit})..."
+                    
+                    # Update status
+                    db = SessionLocal()
+                    proc = db.query(ProcessStatus).filter(ProcessStatus.task_name == "Scraper").first()
+                    if proc:
+                        proc.progress_percent = scrape_progress
+                        proc.last_log = msg
+                        db.commit()
+                    db.close()
+
+                    print(msg)
                     try:
                         detail_page = context.new_page()
                         detail_page.goto(url, timeout=30000)
@@ -361,7 +431,7 @@ def run():
                     })
                     new_this_round += 1
                 
-            if len(posts_data) >= MAX_POSTS:
+            if len(posts_data) >= final_limit:
                 break
                 
             if new_this_round == 0:
@@ -369,7 +439,9 @@ def run():
             else:
                 no_new_posts_count = 0
 
-        print(f"\nСобрано {len(posts_data)} постов. Начинаю синхронизацию с Google Sheets...")
+        msg = f"\nСобрано {len(posts_data)} постов. Начинаю синхронизацию с Google Sheets..."
+        log_to_db(msg)
+        print(msg)
         browser.close()
 
     if not posts_data:
@@ -454,7 +526,9 @@ def run():
         if new_rows:
             worksheet.append_rows(new_rows)
             
-        print(f"Синхронизация завершена! Добавлено новых: {new_count}, обновлено: {updated_count}")
+        msg = f"Синхронизация завершена! Добавлено новых: {new_count}, обновлено: {updated_count}"
+        log_to_db(msg)
+        print(msg)
 
     except Exception as e:
         print(f"Ошибка при работе с Google Sheets: {e}")

@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Response
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError, jwt
@@ -115,6 +115,27 @@ class TaskUpdate(BaseModel):
     class Config:
         from_attributes = True
 
+class LogSchema(BaseModel):
+    id: int
+    timestamp: datetime
+    message: str
+    level: str
+    module: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class ScrapingRequest(BaseModel):
+    target_url: str
+    limit: int = 10
+
+class ConfigUpdate(BaseModel):
+    url: str
+    limit: int
+
+class ConfigSyncRequest(BaseModel):
+    settings: dict
+
 # Auth Helper
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     credentials_exception = HTTPException(
@@ -135,13 +156,39 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 # Core Logic Wrapper
-def run_pipeline_task():
-    print(f"[{datetime.now()}] Starting AutoCMS Pipeline...")
+def run_pipeline_task(target_url: str = None, limit: int = None):
+    db = SessionLocal()
+    # Load from AppConfig if parameters are missing
+    if target_url is None or limit is None:
+        try:
+            configs = db.query(models.AppConfig).all()
+            conf_dict = {c.key: c.value for c in configs}
+            if target_url is None: target_url = conf_dict.get("url")
+            if limit is None: 
+                limit_raw = conf_dict.get("limit")
+                limit = int(limit_raw) if limit_raw else None
+        except Exception as e:
+            print(f"Error reading AppConfig: {e}")
+
+    print(f"[{datetime.now()}] Starting AutoCMS Pipeline (URL: {target_url}, Limit: {limit})...")
+    db = SessionLocal()
+    run_record = models.RunHistory(module_name="Pipeline", status="Running")
+    db.add(run_record)
+    db.commit()
+    
     try:
         from core.pipeline import run_pipeline
-        run_pipeline()
+        # We can pass these to run_pipeline if it supports them
+        run_pipeline(target_url=target_url, limit=limit)
+        run_record.status = "Success"
+        db.commit()
     except Exception as e:
         print(f"Error in pipeline: {e}")
+        run_record.status = "Failed"
+        run_record.result_summary = str(e)
+        db.commit()
+    finally:
+        db.close()
 
 # Endpoints
 @app.post("/api/auth/login", response_model=Token)
@@ -165,8 +212,62 @@ async def start_task(background_tasks: BackgroundTasks, current_user: User = Dep
     background_tasks.add_task(run_pipeline_task)
     return {"status": "started", "message": "Pipeline execution started in background"}
 
+@app.post("/api/scraping/start")
+async def start_scraping(req: ScrapingRequest, background_tasks: BackgroundTasks, current_user: User = Depends(get_current_user)):
+    background_tasks.add_task(run_pipeline_task, target_url=req.target_url, limit=req.limit)
+    return {"status": "started", "message": f"Scraping {req.target_url} (limit: {req.limit}) in background"}
+
+@app.post("/api/config/update")
+async def update_config(conf: ConfigUpdate, current_user: User = Depends(get_current_user)):
+    try:
+        import json
+        config_data = {
+            "url": conf.url,
+            "limit": conf.limit
+        }
+        with open("config.json", "w") as f:
+            json.dump(config_data, f)
+        return {"status": "success", "message": "Config updated"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/config")
+async def get_config(response: Response, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    configs = db.query(models.AppConfig).all()
+    res = {c.key: c.value for c in configs}
+    
+    # Fetch Scraper status
+    status = db.query(models.ProcessStatus).filter(models.ProcessStatus.task_name == "Scraper").first()
+    if status:
+        res["scraper_progress"] = status.progress_percent
+        res["last_log"] = status.last_log
+    else:
+        res["scraper_progress"] = 0
+        res["last_log"] = "System initialized"
+        
+    return res
+
+@app.post("/api/config/sync")
+async def sync_config(req: ConfigSyncRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    for key, value in req.settings.items():
+        conf = db.query(models.AppConfig).filter(models.AppConfig.key == key).first()
+        if conf:
+            conf.value = str(value)
+        else:
+            db.add(models.AppConfig(key=key, value=str(value)))
+    db.commit()
+    return {"status": "success", "message": "Configuration synchronized"}
+
+@app.get("/api/logs", response_model=List[LogSchema])
+async def get_logs(response: Response, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    logs = db.query(models.Log).order_by(models.Log.timestamp.desc()).limit(50).all()
+    return logs
+
 @app.get("/api/tasks", response_model=List[TaskSchema])
-async def get_tasks(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+async def get_tasks(response: Response, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     tasks = db.query(models.ShedevrumTask).order_by(models.ShedevrumTask.created_at.desc()).all()
     return tasks
 

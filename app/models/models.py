@@ -66,3 +66,33 @@ class ShedevrumTask(Base):
 
     def __repr__(self):
         return f"<ShedevrumTask(id={self.id}, status='{self.status}')>"
+
+class Log(Base):
+    __tablename__ = "logs"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    message = Column(Text, nullable=False)
+    level = Column(String, default="INFO") # INFO / ERROR
+    module = Column(String, nullable=True) # e.g., "Scraper", "Generator"
+
+class RunHistory(Base):
+    __tablename__ = "run_history"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    start_time = Column(DateTime, default=datetime.utcnow)
+    module_name = Column(String, nullable=False)
+    status = Column(String, default="Running") # Running / Success / Failed
+    result_summary = Column(String, nullable=True)
+
+class AppConfig(Base):
+    __tablename__ = "app_config"
+    key = Column(String, primary_key=True)
+    value = Column(Text, nullable=True)
+
+class ProcessStatus(Base):
+    __tablename__ = "process_status"
+    task_name = Column(String, primary_key=True)
+    status = Column(String, default="Idle")
+    progress_percent = Column(Integer, default=0)
+    last_log = Column(Text, nullable=True)
